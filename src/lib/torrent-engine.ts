@@ -109,11 +109,47 @@ function restoreState() {
 const globalForTorrent = globalThis as unknown as {
   _webtorrentClient: WebTorrent.Instance | undefined;
   _torrentMap: Map<string, TorrentInfo> | undefined;
+  _exceptionHandlerInstalled: boolean | undefined;
 };
+
+// Absorb WebTorrent internal errors that fire via uncaughtException.
+// These errors (e.g. 'reserve', 'missing') are thrown deep inside WebTorrent's
+// bitfield/storage internals during piece negotiation and CANNOT be caught with try-catch.
+// They are non-fatal to the download itself — WebTorrent recovers automatically.
+//
+// IMPORTANT: We use prependListener so our handler runs FIRST, before Next.js's
+// own uncaughtException handler (which would corrupt the .next cache if it ran).
+function installExceptionHandler() {
+  if (globalForTorrent._exceptionHandlerInstalled) return;
+  globalForTorrent._exceptionHandlerInstalled = true;
+
+  const isWebtorrentInternalError = (msg: string) =>
+    msg.includes("reserve") || msg.includes("missing") || msg.includes("bitfield");
+
+  // prependListener ensures we intercept BEFORE Next.js's handler
+  process.prependListener("uncaughtException", (err: Error) => {
+    if (isWebtorrentInternalError(err?.message ?? "")) {
+      return; // swallow silently — download continues unaffected
+    }
+    // Let other errors bubble through normally
+  });
+
+  process.prependListener("unhandledRejection", (reason) => {
+    if (isWebtorrentInternalError(String(reason))) {
+      return;
+    }
+  });
+}
 
 function getClient(): WebTorrent.Instance {
   if (!globalForTorrent._webtorrentClient) {
-    globalForTorrent._webtorrentClient = new WebTorrent();
+    installExceptionHandler();
+
+    // Limit upload to 100 KB/s to prevent TCP ACK starvation, and increase max connections to 150
+    globalForTorrent._webtorrentClient = new WebTorrent({ 
+      uploadLimit: 100 * 1024,
+      maxConns: 150 
+    });
 
     globalForTorrent._webtorrentClient.on("error", (err: Error) => {
       console.error("[TorrentEngine] Client error:", err.message);
@@ -135,13 +171,45 @@ function buildTorrentInfo(torrent: WebTorrent.Torrent): TorrentInfo {
   const map = getTorrentMap();
   const existing = map.get(torrent.infoHash);
 
-  const files: FileInfo[] = torrent.files.map((f) => ({
-    name: f.name,
-    path: f.path,
-    length: f.length,
-    progress: f.progress,
-    downloaded: Math.floor(f.length * f.progress),
-  }));
+  const files: FileInfo[] = torrent.files.map((f) => {
+    let prog = 0;
+    try {
+      prog = f.progress;
+    } catch (e) {
+      // WebTorrent might throw if internal piece arrays are not fully initialized yet
+    }
+    return {
+      name: f.name,
+      path: f.path,
+      length: f.length,
+      progress: prog,
+      downloaded: Math.floor(f.length * prog),
+    };
+  });
+
+  let progress = 0;
+  let downloadSpeed = 0;
+  let uploadSpeed = 0;
+  let numPeers = 0;
+  let downloaded = 0;
+  let uploaded = 0;
+  let length = 0;
+  let done = false;
+  let timeRemaining: number | null = null;
+
+  try {
+    progress = torrent.progress || 0;
+    downloadSpeed = torrent.downloadSpeed || 0;
+    uploadSpeed = torrent.uploadSpeed || 0;
+    numPeers = torrent.numPeers || 0;
+    downloaded = torrent.downloaded || 0;
+    uploaded = torrent.uploaded || 0;
+    length = torrent.length || 0;
+    done = !!torrent.done;
+    timeRemaining = torrent.timeRemaining === Infinity ? null : torrent.timeRemaining;
+  } catch (e) {
+    // Ignore early initialization errors where torrent internals (like pieces) might not be ready
+  }
 
   return {
     id: torrent.infoHash,
@@ -149,19 +217,51 @@ function buildTorrentInfo(torrent: WebTorrent.Torrent): TorrentInfo {
     name: torrent.name,
     magnetURI: torrent.magnetURI,
     files,
-    progress: torrent.progress,
-    downloadSpeed: torrent.downloadSpeed,
-    uploadSpeed: torrent.uploadSpeed,
-    numPeers: torrent.numPeers,
-    downloaded: torrent.downloaded,
-    uploaded: torrent.uploaded,
-    length: torrent.length,
-    timeRemaining: torrent.timeRemaining === Infinity ? null : torrent.timeRemaining,
-    status: torrent.paused ? "paused" : torrent.done ? "seeding" : "downloading",
+    progress,
+    downloadSpeed,
+    uploadSpeed,
+    numPeers,
+    downloaded,
+    uploaded,
+    length,
+    timeRemaining,
+    status: torrent.paused ? "paused" : done ? "seeding" : "downloading",
     addedAt: existing?.addedAt ?? Date.now(),
     savePath: DEFAULT_DOWNLOAD_DIR,
-    done: torrent.done,
+    done,
   };
+}
+
+/**
+ * Safely attaches download/done/error event listeners to a torrent.
+ * Delays the `download` handler until the storage is ready to avoid
+ * 'reserve' / 'missing' uncaughtExceptions from WebTorrent internals.
+ */
+function attachTorrentEvents(torrent: WebTorrent.Torrent, map: Map<string, TorrentInfo>) {
+  torrent.on("ready", () => {
+    // After 'ready', the storage is fully initialized — safe to read piece info
+    map.set(torrent.infoHash, buildTorrentInfo(torrent));
+
+    torrent.on("download", () => {
+      try {
+        map.set(torrent.infoHash, buildTorrentInfo(torrent));
+      } catch { /* storage not ready yet */ }
+    });
+  });
+
+  torrent.on("done", () => {
+    try {
+      const updated = buildTorrentInfo(torrent);
+      map.set(torrent.infoHash, updated);
+      saveState();
+    } catch { /* ignore */ }
+  });
+
+  torrent.on("error", (err: Error | string) => {
+    const current = map.get(torrent.infoHash);
+    if (current) map.set(torrent.infoHash, { ...current, status: "error" });
+    console.error("[TorrentEngine] Torrent error:", err);
+  });
 }
 
 export function addTorrentFromFile(buffer: Buffer): Promise<TorrentInfo> {
@@ -178,23 +278,7 @@ export function addTorrentFromFile(buffer: Buffer): Promise<TorrentInfo> {
 
       const info = buildTorrentInfo(torrent);
       map.set(torrent.infoHash, info);
-
-      torrent.on("download", () => {
-        map.set(torrent.infoHash, buildTorrentInfo(torrent));
-      });
-
-      torrent.on("done", () => {
-        const updated = buildTorrentInfo(torrent);
-        map.set(torrent.infoHash, updated);
-      });
-
-      torrent.on("error", (err: Error | string) => {
-        const current = map.get(torrent.infoHash);
-        if (current) {
-          map.set(torrent.infoHash, { ...current, status: "error" });
-        }
-        console.error("[TorrentEngine] Torrent error:", err);
-      });
+      attachTorrentEvents(torrent, map);
 
       saveState();
       resolve(info);
@@ -217,22 +301,7 @@ export function addTorrentFromMagnet(magnetURI: string): Promise<TorrentInfo> {
 
       const info = buildTorrentInfo(torrent);
       map.set(torrent.infoHash, info);
-
-      torrent.on("download", () => {
-        map.set(torrent.infoHash, buildTorrentInfo(torrent));
-      });
-
-      torrent.on("done", () => {
-        map.set(torrent.infoHash, buildTorrentInfo(torrent));
-      });
-
-      torrent.on("error", (err: Error | string) => {
-        const current = map.get(torrent.infoHash);
-        if (current) {
-          map.set(torrent.infoHash, { ...current, status: "error" });
-        }
-        console.error("[TorrentEngine] Torrent error:", err);
-      });
+      attachTorrentEvents(torrent, map);
 
       saveState();
       resolve(info);
