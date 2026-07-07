@@ -19,13 +19,14 @@ export async function register() {
       const msg = error instanceof Error ? error.message : String(error);
       
       // If it's the WebTorrent null-piece bug, SWALLOW IT COMPLETELY.
-      // Next.js will never even know this error occurred.
+      // Returning `true` tells Node.js that this event was "handled" and
+      // prevents it from crashing the process.
       if (
         msg.includes("reading 'missing'") ||
         msg.includes("reading 'reserve'") ||
         msg.includes("reading 'length'")
       ) {
-        return false; 
+        return true; 
       }
     }
     
