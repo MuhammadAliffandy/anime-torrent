@@ -146,9 +146,10 @@ function getClient(): WebTorrent.Instance {
   if (!globalForTorrent._webtorrentClient) {
     installExceptionHandler();
 
-    // Limit upload to 100 KB/s to prevent TCP ACK starvation, and increase max connections to 150
+    // Upload enough to peers so they don't choke us (tit-for-tat algorithm)
+    // 500 KB/s is a good balance between being a good peer and not saturating upload bandwidth
     globalForTorrent._webtorrentClient = new WebTorrent({ 
-      uploadLimit: 100 * 1024,
+      uploadLimit: 500 * 1024,
       maxConns: 150 
     });
 
@@ -247,16 +248,12 @@ function buildTorrentInfo(torrent: WebTorrent.Torrent): TorrentInfo {
 
 /**
  * Safely attaches download/done/error event listeners to a torrent.
- * Delays the `download` handler until the storage is ready to avoid
- * 'reserve' / 'missing' uncaughtExceptions from WebTorrent internals.
+ * Also installs wire-level error handlers to prevent peer disconnection
+ * from internal WebTorrent errors like 'private', 'missing', 'reserve'.
  */
 function attachTorrentEvents(torrent: WebTorrent.Torrent, map: Map<string, TorrentInfo>) {
-  torrent.on("ready", () => {
-    // After 'ready', the storage is fully initialized — safe to read piece info
-    map.set(torrent.infoHash, buildTorrentInfo(torrent));
-
-    // Cache the raw .torrent metadata as soon as it's available
-  // This ensures that on Next.js restart, we don't have to wait for peers to send metadata again
+  // Cache the raw .torrent metadata as soon as it's available
+  // (fires independently of 'ready')
   torrent.on("metadata", () => {
     if (torrent.torrentFile) {
       const cachePath = path.join(CACHE_DIR, `${torrent.infoHash}.torrent`);
@@ -264,11 +261,24 @@ function attachTorrentEvents(torrent: WebTorrent.Torrent, map: Map<string, Torre
     }
   });
 
-  torrent.on("download", () => {
-      try {
-        map.set(torrent.infoHash, buildTorrentInfo(torrent));
-      } catch { /* storage not ready yet */ }
+  // Intercept EVERY new peer wire connection and install an error handler
+  // so that internal WebTorrent errors don't kill the wire
+  torrent.on("wire", (wire: unknown) => {
+    const w = wire as { on: (event: string, cb: (...args: unknown[]) => void) => void };
+    w.on("error", () => {
+      // Silently absorb wire-level errors — WebTorrent will reconnect automatically
     });
+  });
+
+  torrent.on("ready", () => {
+    // After 'ready', the storage is fully initialized — safe to read piece info
+    map.set(torrent.infoHash, buildTorrentInfo(torrent));
+  });
+
+  torrent.on("download", () => {
+    try {
+      map.set(torrent.infoHash, buildTorrentInfo(torrent));
+    } catch { /* storage not ready yet */ }
   });
 
   torrent.on("done", () => {
@@ -280,6 +290,11 @@ function attachTorrentEvents(torrent: WebTorrent.Torrent, map: Map<string, Torre
   });
 
   torrent.on("error", (err: Error | string) => {
+    const msg = err instanceof Error ? err.message : String(err);
+    // Don't mark torrent as "error" for internal WebTorrent glitches
+    if (msg.includes("private") || msg.includes("missing") || msg.includes("reserve")) {
+      return;
+    }
     const current = map.get(torrent.infoHash);
     if (current) map.set(torrent.infoHash, { ...current, status: "error" });
     console.error("[TorrentEngine] Torrent error:", err);
