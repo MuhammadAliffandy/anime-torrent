@@ -56,6 +56,11 @@ const ANNOUNCE_LIST = [
 ];
 
 const STATE_FILE = path.join(DEFAULT_DOWNLOAD_DIR, ".torrents-state.json");
+const CACHE_DIR = path.join(DEFAULT_DOWNLOAD_DIR, ".torrents-cache");
+
+if (!fs.existsSync(CACHE_DIR)) {
+  fs.mkdirSync(CACHE_DIR, { recursive: true });
+}
 
 function saveState() {
   try {
@@ -81,22 +86,18 @@ function restoreState() {
     
     for (const t of state) {
       if (t.magnetURI) {
-        client.add(t.magnetURI, { path: DEFAULT_DOWNLOAD_DIR, announce: ANNOUNCE_LIST }, (torrent) => {
+        const cachePath = path.join(CACHE_DIR, `${t.id}.torrent`);
+        // If we have cached the metadata file, use it directly so it loads instantly without peers!
+        const addTarget = fs.existsSync(cachePath) ? cachePath : t.magnetURI;
+
+        client.add(addTarget, { path: DEFAULT_DOWNLOAD_DIR, announce: ANNOUNCE_LIST }, (torrent) => {
           if (t.paused) torrent.pause();
           
           const info = buildTorrentInfo(torrent);
           if (t.paused) info.status = "paused";
           map.set(torrent.infoHash, info);
           
-          torrent.on("download", () => map.set(torrent.infoHash, buildTorrentInfo(torrent)));
-          torrent.on("done", () => {
-            map.set(torrent.infoHash, buildTorrentInfo(torrent));
-            saveState();
-          });
-          torrent.on("error", () => {
-            const current = map.get(torrent.infoHash);
-            if (current) map.set(torrent.infoHash, { ...current, status: "error" });
-          });
+          attachTorrentEvents(torrent, map);
         });
       }
     }
@@ -211,6 +212,18 @@ function buildTorrentInfo(torrent: WebTorrent.Torrent): TorrentInfo {
     // Ignore early initialization errors where torrent internals (like pieces) might not be ready
   }
 
+  // Fallback to manual computation if WebTorrent global stats threw an error 
+  // (This ensures UI doesn't show 0 B / 0 B when files are already known)
+  if (length === 0 && files.length > 0) {
+    length = files.reduce((acc, f) => acc + f.length, 0);
+  }
+  if (downloaded === 0 && files.length > 0) {
+    downloaded = files.reduce((acc, f) => acc + f.downloaded, 0);
+  }
+  if (progress === 0 && length > 0) {
+    progress = downloaded / length;
+  }
+
   return {
     id: torrent.infoHash,
     infoHash: torrent.infoHash,
@@ -242,7 +255,16 @@ function attachTorrentEvents(torrent: WebTorrent.Torrent, map: Map<string, Torre
     // After 'ready', the storage is fully initialized — safe to read piece info
     map.set(torrent.infoHash, buildTorrentInfo(torrent));
 
-    torrent.on("download", () => {
+    // Cache the raw .torrent metadata as soon as it's available
+  // This ensures that on Next.js restart, we don't have to wait for peers to send metadata again
+  torrent.on("metadata", () => {
+    if (torrent.torrentFile) {
+      const cachePath = path.join(CACHE_DIR, `${torrent.infoHash}.torrent`);
+      fs.writeFileSync(cachePath, torrent.torrentFile);
+    }
+  });
+
+  torrent.on("download", () => {
       try {
         map.set(torrent.infoHash, buildTorrentInfo(torrent));
       } catch { /* storage not ready yet */ }
@@ -293,13 +315,33 @@ export function addTorrentFromMagnet(magnetURI: string): Promise<TorrentInfo> {
     const client = getClient();
     const map = getTorrentMap();
 
-    client.add(magnetURI, { path: DEFAULT_DOWNLOAD_DIR, announce: ANNOUNCE_LIST }, (torrent: WebTorrent.Torrent) => {
+    // Check if we have this magnet's metadata cached locally
+    let addTarget = magnetURI;
+    const match = magnetURI.match(/xt=urn:btih:([a-zA-Z0-9]+)/i);
+    if (match) {
+      const infoHash = match[1].toLowerCase();
+      const cachePath = path.join(CACHE_DIR, `${infoHash}.torrent`);
+      if (fs.existsSync(cachePath)) {
+        addTarget = cachePath;
+      }
+    }
+
+    client.add(addTarget, { path: DEFAULT_DOWNLOAD_DIR, announce: ANNOUNCE_LIST }, (torrent: WebTorrent.Torrent) => {
+      // If we loaded from cache, ensure the magnetURI in the UI remains the original one
+      // (WebTorrent might generate a simpler magnet link from the .torrent file)
+      if (addTarget !== magnetURI && !torrent.magnetURI) {
+         // Fallback if needed, though WebTorrent usually auto-generates it
+      }
+
       if (map.has(torrent.infoHash)) {
         resolve(map.get(torrent.infoHash)!);
         return;
       }
 
       const info = buildTorrentInfo(torrent);
+      // Force the original magnetURI to be saved so we don't lose the user's input
+      info.magnetURI = magnetURI; 
+      
       map.set(torrent.infoHash, info);
       attachTorrentEvents(torrent, map);
 
