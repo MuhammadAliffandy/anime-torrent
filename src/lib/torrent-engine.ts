@@ -125,7 +125,7 @@ function installExceptionHandler() {
   globalForTorrent._exceptionHandlerInstalled = true;
 
   const isWebtorrentInternalError = (msg: string) =>
-    msg.includes("reserve") || msg.includes("missing") || msg.includes("bitfield");
+    msg.includes("reserve") || msg.includes("missing") || msg.includes("bitfield") || msg.includes("private");
 
   // prependListener ensures we intercept BEFORE Next.js's handler
   process.prependListener("uncaughtException", (err: Error) => {

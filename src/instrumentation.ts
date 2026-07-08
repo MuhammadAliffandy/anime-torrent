@@ -24,7 +24,8 @@ export async function register() {
       if (
         msg.includes("reading 'missing'") ||
         msg.includes("reading 'reserve'") ||
-        msg.includes("reading 'length'")
+        msg.includes("reading 'length'") ||
+        msg.includes("reading 'private'")
       ) {
         return true; 
       }
